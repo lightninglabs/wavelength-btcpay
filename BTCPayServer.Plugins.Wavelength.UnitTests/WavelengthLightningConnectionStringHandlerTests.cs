@@ -35,7 +35,7 @@ public class WavelengthLightningConnectionStringHandlerTests
         // the class-level comment). Passing empty implementations keeps that explicit rather than
         // letting a stub that answers "approved" quietly hide a regression in the real check.
         _handler = new WavelengthLightningConnectionStringHandler(
-            null!, _tokenProtector, new FakeStoreApprovals(), new FakeServerSettings(), NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
+            null!, _tokenProtector, new FakeStoreApprovals(), new FakeServerSettings(), null!, NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
     }
 
     /// <summary>A token for a store that has one, in the shape Create accepts.</summary>
@@ -299,7 +299,7 @@ public class WavelengthLightningConnectionStringHandlerTests
 
     // A local value that was never approved for this store at all (nothing persisted yet) must not
     // be accepted just because some OTHER store, or a prior session, happened to set the marker -
-    // GetApprovedLocalFlags returning null is "nothing to compare against", not "anything goes".
+    // GetCurrentlySavedFlags returning null is "nothing to compare against", not "anything goes".
     [Fact]
     public void RejectsANewLocalValueWhenNothingIsPersistedYet()
     {
@@ -320,6 +320,51 @@ public class WavelengthLightningConnectionStringHandlerTests
         Assert.True(WavelengthLightningConnectionStringHandler.LocalValuesMatchWhatIsAlreadyPersisted(
             changedToAnotherPublicUrl, persisted));
     }
+
+    // The exact regression reported: BTCPay core's "Test connection" button runs the very same
+    // ValidatePaymentMethodConfig -> Create path a real save does, for whatever is currently typed
+    // into the form, without ever persisting it. Comparing a non-admin's candidate flags against a
+    // value recorded at the moment an administrator's request was merely validated - rather than
+    // against what is actually saved - let an admin's Test(B) against a store whose saved string
+    // still pointed at an earlier approved local value A silently record B as the latest approval,
+    // breaking the very next non-admin checkout for the still-saved A. ExtractPersistedFlags is what
+    // closes that: it only ever parses whatever string it is handed, and in production that string is
+    // always GetCurrentlySavedFlags's live read of the store's own saved connection string - never
+    // anything an admin's request merely validated along the way - so there is nothing for a Test
+    // click to ever leave behind for a later request to be compared against.
+    [Fact]
+    public void ExtractPersistedFlagsReflectsOnlyWhatIsActuallySavedNotWhatWasMerelyTested()
+    {
+        const string actuallySavedConnectionStringA =
+            "type=wavelength;token=abc;wallet.esploraurl=http://127.0.0.1:5000/api";
+
+        var persistedFlags = WavelengthLightningConnectionStringHandler.ExtractPersistedFlags(actuallySavedConnectionStringA);
+
+        // Store A's own candidate, from a later non-admin checkout, must still match what was
+        // actually saved for it - regardless of what an admin's Test(B) click elsewhere might have
+        // asked Create to validate in between, since that never reaches this function's input at all.
+        var candidateA = Flags((WavedFlagValues.EsploraUrlFlag, "http://127.0.0.1:5000/api"));
+        Assert.True(WavelengthLightningConnectionStringHandler.LocalValuesMatchWhatIsAlreadyPersisted(
+            candidateA, persistedFlags));
+
+        // The value an admin merely tested (B) must NOT be treated as something approved for A.
+        var testedButNeverSavedB = Flags((WavedFlagValues.EsploraUrlFlag, "http://169.254.169.254/latest/meta-data/"));
+        Assert.False(WavelengthLightningConnectionStringHandler.LocalValuesMatchWhatIsAlreadyPersisted(
+            testedButNeverSavedB, persistedFlags));
+    }
+
+    [Fact]
+    public void ExtractPersistedFlagsIsNullWhenNothingIsSaved()
+        => Assert.Null(WavelengthLightningConnectionStringHandler.ExtractPersistedFlags(null));
+
+    // A store whose Lightning node was switched away from Wavelength entirely (or never configured
+    // for it) has nothing for a wavelength candidate to be compared against - handled the same way as
+    // "nothing saved yet" rather than attempting to parse a foreign connection string's keys as if
+    // they were waved flags.
+    [Fact]
+    public void ExtractPersistedFlagsIgnoresASavedConnectionStringOfADifferentType()
+        => Assert.Null(WavelengthLightningConnectionStringHandler.ExtractPersistedFlags(
+            "type=lnd-rest;server=https://example.com"));
 
     // Each key carries a value that passes its own check as well as the key allowlist: the two
     // URL-shaped keys need a real public URL, and everything else is a plain count/duration/enum.
@@ -359,7 +404,7 @@ public class WavelengthLightningConnectionStringHandlerTests
     {
         var approvals = new FakeStoreApprovals();
         var handler = new WavelengthLightningConnectionStringHandler(
-            null!, _tokenProtector, approvals, new FakeServerSettings(), NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
+            null!, _tokenProtector, approvals, new FakeServerSettings(), null!, NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
         var token = TokenFor("store-a");
 
         // A background consumer's read: no acting store, valid current token. Every check passes and
@@ -389,7 +434,7 @@ public class WavelengthLightningConnectionStringHandlerTests
         var approvals = new FakeStoreApprovals();
         approvals.Approve("store-a", allowLocalEndpoints: true);
         var handler = new WavelengthLightningConnectionStringHandler(
-            null!, _tokenProtector, approvals, new FakeServerSettings(), NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
+            null!, _tokenProtector, approvals, new FakeServerSettings(), null!, NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
         var token = TokenFor("store-a");
 
         Assert.Throws<ArgumentNullException>(() =>
@@ -405,7 +450,7 @@ public class WavelengthLightningConnectionStringHandlerTests
         var approvals = new FakeStoreApprovals();
         approvals.Approve("store-a", allowLocalEndpoints: false);
         var handler = new WavelengthLightningConnectionStringHandler(
-            null!, _tokenProtector, approvals, new FakeServerSettings(), NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
+            null!, _tokenProtector, approvals, new FakeServerSettings(), null!, NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
         var token = TokenFor("store-a");
 
         var client = handler.Create(
@@ -426,7 +471,7 @@ public class WavelengthLightningConnectionStringHandlerTests
         var approvals = new FakeStoreApprovals();
         var settings = new WavelengthServerSettings { AllowForAllStores = true };
         var handler = new WavelengthLightningConnectionStringHandler(
-            null!, _tokenProtector, approvals, new FakeServerSettings(settings), NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
+            null!, _tokenProtector, approvals, new FakeServerSettings(settings), null!, NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
         var token = TokenFor("store-a");
 
         Assert.Throws<ArgumentNullException>(() =>

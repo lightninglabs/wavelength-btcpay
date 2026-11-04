@@ -11,7 +11,6 @@ public sealed class FakeStoreApprovals : IWavedStoreApprovals
 {
     private readonly Dictionary<string, bool> _approved = new();
     private readonly Dictionary<string, bool> _allowLocalEndpoints = new();
-    private readonly Dictionary<string, IReadOnlyDictionary<string, string>> _approvedLocalFlags = new();
 
     /// <summary>How many times an approval was recorded, so a test can assert a read wrote nothing.</summary>
     public int WriteCount { get; private set; }
@@ -22,27 +21,14 @@ public sealed class FakeStoreApprovals : IWavedStoreApprovals
         _allowLocalEndpoints[storeId] = allowLocalEndpoints;
     }
 
-    /// <summary>
-    /// Stands in for the flags WavedStoreSettingsStore.ApproveAsync records at approval time (see
-    /// WavedStoreSettings.ApprovedLocalFlags), independent of the approval markers above.
-    /// </summary>
-    public void ApproveLocalFlags(string storeId, IReadOnlyDictionary<string, string> flags)
-        => _approvedLocalFlags[storeId] = flags;
-
     public bool IsApproved(string storeId) => _approved.ContainsKey(storeId);
 
     public bool AllowsLocalEndpoints(string storeId) => _allowLocalEndpoints.TryGetValue(storeId, out var v) && v;
 
-    public IReadOnlyDictionary<string, string>? GetApprovedLocalFlags(string storeId)
-        => _approvedLocalFlags.GetValueOrDefault(storeId);
-
-    public Task ApproveAsync(
-        string storeId, bool allowLocalValues, IReadOnlyDictionary<string, string> extraFlags,
-        CancellationToken cancellationToken = default)
+    public Task ApproveAsync(string storeId, bool allowLocalValues, CancellationToken cancellationToken = default)
     {
         WriteCount++;
         Approve(storeId, allowLocalValues || AllowsLocalEndpoints(storeId));
-        ApproveLocalFlags(storeId, extraFlags);
         return Task.CompletedTask;
     }
 }
