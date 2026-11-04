@@ -35,7 +35,7 @@ public class WavelengthLightningConnectionStringHandlerTests
         // the class-level comment). Passing empty implementations keeps that explicit rather than
         // letting a stub that answers "approved" quietly hide a regression in the real check.
         _handler = new WavelengthLightningConnectionStringHandler(
-            null!, _tokenProtector, new FakeStoreApprovals(), new FakeServerSettings(), null!, NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
+            null!, _tokenProtector, new FakeStoreApprovals(), new FakeServerSettings(), NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
     }
 
     /// <summary>A token for a store that has one, in the shape Create accepts.</summary>
@@ -404,7 +404,7 @@ public class WavelengthLightningConnectionStringHandlerTests
     {
         var approvals = new FakeStoreApprovals();
         var handler = new WavelengthLightningConnectionStringHandler(
-            null!, _tokenProtector, approvals, new FakeServerSettings(), null!, NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
+            null!, _tokenProtector, approvals, new FakeServerSettings(), NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
         var token = TokenFor("store-a");
 
         // A background consumer's read: no acting store, valid current token. Every check passes and
@@ -434,7 +434,7 @@ public class WavelengthLightningConnectionStringHandlerTests
         var approvals = new FakeStoreApprovals();
         approvals.Approve("store-a", allowLocalEndpoints: true);
         var handler = new WavelengthLightningConnectionStringHandler(
-            null!, _tokenProtector, approvals, new FakeServerSettings(), null!, NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
+            null!, _tokenProtector, approvals, new FakeServerSettings(), NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
         var token = TokenFor("store-a");
 
         Assert.Throws<ArgumentNullException>(() =>
@@ -450,7 +450,7 @@ public class WavelengthLightningConnectionStringHandlerTests
         var approvals = new FakeStoreApprovals();
         approvals.Approve("store-a", allowLocalEndpoints: false);
         var handler = new WavelengthLightningConnectionStringHandler(
-            null!, _tokenProtector, approvals, new FakeServerSettings(), null!, NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
+            null!, _tokenProtector, approvals, new FakeServerSettings(), NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
         var token = TokenFor("store-a");
 
         var client = handler.Create(
@@ -471,7 +471,7 @@ public class WavelengthLightningConnectionStringHandlerTests
         var approvals = new FakeStoreApprovals();
         var settings = new WavelengthServerSettings { AllowForAllStores = true };
         var handler = new WavelengthLightningConnectionStringHandler(
-            null!, _tokenProtector, approvals, new FakeServerSettings(settings), null!, NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
+            null!, _tokenProtector, approvals, new FakeServerSettings(settings), NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
         var token = TokenFor("store-a");
 
         Assert.Throws<ArgumentNullException>(() =>

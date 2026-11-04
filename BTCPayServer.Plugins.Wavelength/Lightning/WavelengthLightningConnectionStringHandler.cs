@@ -2,9 +2,7 @@ using BTCPayServer.Abstractions.Contracts;
 using BTCPayServer.Data;
 using BTCPayServer.Lightning;
 using BTCPayServer.Payments;
-using BTCPayServer.Payments.Lightning;
 using BTCPayServer.Plugins.Wavelength.Services;
-using BTCPayServer.Services.Invoices;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -45,7 +43,6 @@ public sealed class WavelengthLightningConnectionStringHandler : ILightningConne
     private readonly WavedStoreTokenProtector _tokenProtector;
     private readonly IWavedStoreApprovals _storeApprovals;
     private readonly IWavelengthServerSettingsSource _serverSettings;
-    private readonly PaymentMethodHandlerDictionary _handlers;
     private readonly ILogger<WavelengthLightningConnectionStringHandler> _logger;
 
     /// <summary>
@@ -65,14 +62,12 @@ public sealed class WavelengthLightningConnectionStringHandler : ILightningConne
         WavedStoreTokenProtector tokenProtector,
         IWavedStoreApprovals storeApprovals,
         IWavelengthServerSettingsSource serverSettings,
-        PaymentMethodHandlerDictionary handlers,
         ILogger<WavelengthLightningConnectionStringHandler> logger)
     {
         _serviceProvider = serviceProvider;
         _tokenProtector = tokenProtector;
         _storeApprovals = storeApprovals;
         _serverSettings = serverSettings;
-        _handlers = handlers;
         _logger = logger;
         _httpContextAccessor = new Lazy<IHttpContextAccessor?>(ResolveHttpContextAccessor);
     }
@@ -392,17 +387,30 @@ public sealed class WavelengthLightningConnectionStringHandler : ILightningConne
     /// very value core just read from this same row, so it always matches trivially; and a disallowed
     /// value already sitting on this row could only have gotten there through this same accepting
     /// path when it was actually saved, so trusting it here is not a new hole.
+    ///
+    /// Reads the store's raw payment method config JSON directly (StoreData.GetPaymentMethodConfig
+    /// with no PaymentMethodHandlerDictionary argument) rather than going through the handlers
+    /// dictionary and LightningLikePaymentHandler.ParsePaymentMethodConfig the way
+    /// UIWavelengthController does. Injecting PaymentMethodHandlerDictionary here creates a cycle in
+    /// BTCPay's DI graph: the dictionary resolves every IPaymentMethodHandler, including
+    /// LightningLikePaymentHandler, whose constructor resolves LightningClientFactoryService, which
+    /// in turn resolves every ILightningConnectionStringHandler - this one included - to find out
+    /// which connection strings it can handle. Resolving the dictionary (or the Lightning client
+    /// factory) from inside this handler's own constructor therefore resolves back to this handler
+    /// before it exists. The connection string is all this method needs, and the raw JSON holds it
+    /// under "connectionString" (BlobSerializer camel-cases property names) without requiring
+    /// anything beyond StoreData itself.
     /// </summary>
     private IReadOnlyDictionary<string, string>? GetCurrentlySavedFlags(StoreData? store)
     {
-        var saved = store?.GetPaymentMethodConfig<LightningPaymentMethodConfig>(LightningPaymentMethodId, _handlers);
-        return ExtractPersistedFlags(saved?.ConnectionString);
+        var saved = store?.GetPaymentMethodConfig(LightningPaymentMethodId);
+        return ExtractPersistedFlags((string?)saved?["connectionString"]);
     }
 
     /// <summary>
     /// The pure parsing step <see cref="GetCurrentlySavedFlags"/> delegates to, split out so it can be
-    /// exercised directly with a plain string rather than a StoreData/PaymentMethodHandlerDictionary
-    /// pair neither this test suite nor a lightweight caller can cheaply build.
+    /// exercised directly with a plain string rather than a StoreData neither this test suite nor a
+    /// lightweight caller can cheaply build.
     /// </summary>
     internal static IReadOnlyDictionary<string, string>? ExtractPersistedFlags(string? savedConnectionString)
     {
