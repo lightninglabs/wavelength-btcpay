@@ -34,13 +34,26 @@ public static class WavedAllowedFlags
 {
     // Exact flag keys a store's own connection string may set, reviewed against waved/config.go:
     // none of them takes a local file/directory path, a listen/bind address, or auth material,
-    // and none shares a resource across stores.
+    // and none shares a resource across stores. The one deliberate exception is "server" - an
+    // outbound dial target this plugin validates itself (WavedFlagValues.ValidateServer), not a
+    // listen address or a path; see its own inline comment and WavedOperatorServer for why it does
+    // not lean on BTCPay's own connection-string safety check for this.
     private static readonly IReadOnlySet<string> ExactKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         // Network/backend selection and general daemon behavior.
         "network",
         "debuglevel",
         "allow-mainnet",
+
+        // Not a waved flag name at all - this plugin's own connection-string-facing name for
+        // waved's --server.host (the Ark operator address). Left unset, waved uses its own built-in
+        // per-network default - this plugin's own code never requires this key - but whether a
+        // non-admin CAN leave it unset at all depends on exactly which BTCPay Server version is
+        // running, which is why the setup page's samples include it regardless. See
+        // WavedOperatorServer's class doc comment for the full story (the version difference, why a
+        // scheme is always needed when this key is present) and why "server.host" itself is
+        // deliberately not the allowlisted spelling.
+        "server",
 
         // Round/registration/signing timing knobs - plain durations/counts, no I/O of their own.
         "forfeitcollectiontimeout",

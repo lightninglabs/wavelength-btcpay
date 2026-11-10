@@ -43,11 +43,36 @@ public interface IWavedStoreApprovals
     bool IsApproved(string storeId);
 
     /// <summary>
+    /// Whether a server administrator has deliberately allowed this store's connection string to
+    /// carry local/private endpoint values (a LAN esplora, a local Ark operator, ...), recorded the
+    /// one time an admin's own save actually contained one - see <see cref="ApproveAsync"/>.
+    ///
+    /// This is what lets BTCPayServer.Plugins.Wavelength.Lightning.WavelengthLightningConnectionStringHandler.Create
+    /// re-validate an already-approved store's saved connection string on every later call (an invoice, a
+    /// payout, a background poll - none of which carry an administrator's own request context) and
+    /// still accept the same local value an admin was once allowed to save: the decision was made
+    /// once, by someone entitled to make it, and does not need remaking by whoever happens to be
+    /// asking now. Synchronous and cached for the same reason <see cref="IsApproved"/> is - this is
+    /// asked on every connection string this store parses, including the public, unauthenticated
+    /// checkout path.
+    /// </summary>
+    bool AllowsLocalEndpoints(string storeId);
+
+    /// <summary>
     /// Records that this store has been adopted, and whether it may carry local/private endpoint
     /// values. Called only for accepted administrator saves (see the handler's RecordApproval), so
     /// the write happens rarely; the implementation is still responsible for writing nothing when
-    /// neither fact would change - an ordinary Lightning operation by an approved store reaches the
-    /// handler with a context attached and must not pay for a write on the hottest path there is.
+    /// neither fact would change - an ordinary Lightning operation performed by an administrator (an
+    /// admin's own API key creating an invoice, say) reaches the handler with isServerAdmin true and
+    /// must not pay for a write on every single one of those calls.
+    ///
+    /// Deliberately does not record which specific flags were approved: see
+    /// WavelengthLightningConnectionStringHandler.GetCurrentlySavedFlags for why a non-admin's
+    /// address-valued flags are compared against the store's live, currently-saved connection string
+    /// instead of anything recorded here. A value recorded at the moment of THIS call would be the
+    /// value an administrator's request happened to be validating - which is also what BTCPay core's
+    /// "Test connection" button submits through this same path, without ever persisting it - not
+    /// necessarily the value that ends up saved.
     /// </summary>
     Task ApproveAsync(string storeId, bool allowLocalValues, CancellationToken cancellationToken = default);
 }
@@ -175,9 +200,14 @@ public sealed class WavedStoreSettingsStore(StoreRepository storeRepository) : I
     public bool IsApproved(string storeId)
         => GetAsync(storeId).GetAwaiter().GetResult().ServerAdminApproved;
 
+    /// <summary>See <see cref="IWavedStoreApprovals.AllowsLocalEndpoints"/> - a cached read, same as
+    /// <see cref="IsApproved"/>.</summary>
+    public bool AllowsLocalEndpoints(string storeId)
+        => GetAsync(storeId).GetAwaiter().GetResult().AllowLocalEndpoints;
+
     /// <summary>See <see cref="IWavedStoreApprovals.ApproveAsync"/> - writes only when one of the two
-    /// facts actually changes, so the unauthenticated invoice path (which reaches the handler with a
-    /// request context attached, and therefore reaches this) stops at an in-memory comparison.
+    /// facts actually changes, so an administrator's own ordinary Lightning operations (which reach
+    /// the handler with isServerAdmin true, and therefore reach this) stop at an in-memory comparison.
     /// Called only for actual administrator saves - see the handler's RecordApproval for why a
     /// save allowed through by AllowForAllStores records nothing.</summary>
     public async Task ApproveAsync(

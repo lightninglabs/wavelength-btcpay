@@ -12,13 +12,33 @@ namespace BTCPayServer.Plugins.Wavelength.Services;
 /// Why the second question is needed: several flags the allowlist rightly permits are addresses the
 /// server's own waved process will then connect to itself. wallet.esploraurl and wallet.feeurl are
 /// URLs waved fetches over HTTP(S); wallet.btcwallet_peers and wallet.btcwallet_addpeers are
-/// host:port pairs it dials. A store owner who can set those can aim the *server* at anything the
-/// *server* can reach - a cloud metadata endpoint on 169.254.169.254, this instance's own NBXplorer,
-/// another store's waved instance on loopback, an RFC1918 host on the internal network - turning a
-/// store they own into a request-forwarding primitive against their hosting provider's network.
-/// The dashboard's error surfaces (a startup failure's stderr, a gRPC status message) are the
-/// response half of that primitive, which is why the controllers cap what they display - see
-/// UIWavelengthController.TruncateErrorText.
+/// host:port pairs it dials; server (waved's --server.host, see WavedOperatorServer) is the gRPC
+/// target it dials for the Ark operator connection itself. A store owner who can set those can aim
+/// the *server* at anything the *server* can reach - a cloud metadata endpoint on 169.254.169.254,
+/// this instance's own NBXplorer, another store's waved instance on loopback, an RFC1918 host on the
+/// internal network - turning a store they own into a request-forwarding primitive against their
+/// hosting provider's network. The dashboard's error surfaces (a startup failure's stderr, a gRPC
+/// status message) are the response half of that primitive, which is why the controllers cap what
+/// they display - see UIWavelengthController.TruncateErrorText.
+///
+/// server gets a stricter check than a plain host:port, and deliberately does not lean on core's own
+/// connection-string safety check for it (see WavedOperatorServer's class comment for exactly what
+/// that check requires and does not require - it differs between BTCPay Server versions, which an
+/// earlier version of this comment got wrong by assuming only one of them): whichever version is
+/// running, that check validates the "server" value, when present, by parsing it as a URI and
+/// inspecting only its Host, but waved hands the same string to grpc.NewClient unparsed, and gRPC's
+/// own target syntax treats an "xyz://" prefix as *selecting a resolver*, not as part of an address
+/// it validates as a unit. A value like "passthrough://8.8.8.8/127.0.0.1:10029" has a public,
+/// non-local Host ("8.8.8.8") as far as core's Uri-based check is concerned, so a non-admin can save
+/// it - but gRPC's "passthrough" resolver (registered in this exact dependency tree - see
+/// sdk/ark/inprocess.go and embedded.go, which both dial "passthrough:///bufnet") ignores the
+/// authority entirely and dials the literal endpoint after the slash instead: 127.0.0.1:10029, not
+/// 8.8.8.8. Core's check and waved's actual dial target can therefore disagree completely, which is
+/// exactly the gap ValidateServer closes by rejecting anything but a bare host:port (optionally
+/// http(s)-prefixed) outright, independent of what core already allowed, and independent of whether
+/// core's check even runs before this plugin's own Create does (on the pinned submodule it does not;
+/// on BTCPay's current release line it does - see WavedOperatorServer) - this check is a primary
+/// defense either way, not a backstop that assumes core's check already ran.
 ///
 /// What this deliberately does not do: resolve DNS. A name that looks public here can resolve to an
 /// internal address by the time waved resolves it, so this raises the cost of the attack rather
@@ -41,18 +61,33 @@ public static class WavedFlagValues
     public const string BtcwalletAddPeersFlag = "wallet.btcwallet_addpeers";
 
     /// <summary>
+    /// The connection-string key for waved's own --server.host flag - the Ark operator address. See
+    /// WavedOperatorServer for why the connection-string key differs from the waved flag name, and
+    /// this class's doc comment for why this gets its own, stricter check rather than reusing
+    /// ValidateUrl's.
+    /// </summary>
+    public const string ServerFlag = "server";
+
+    /// <summary>
     /// Validates every address-valued flag in <paramref name="flags"/>, returning false and a
     /// message naming the offending flag and value when one is not acceptable.
     ///
     /// <paramref name="allowLocal"/> is the deliberate escape hatch for a server administrator who
     /// really does run esplora, a fee service, or a btcwallet peer on their own LAN. It has to be
-    /// passed explicitly at each call site, and the only call site that ever passes true is the
-    /// connection-string handler with a verified administrator behind it - a background restart
-    /// re-reading already-persisted flags has no user to check and so always validates strictly.
-    /// What carries an admin's decision past that point is
-    /// <see cref="WavedStoreSettings.AllowLocalEndpoints"/>, recorded when the string was saved, so
-    /// strictness at restart time does not silently undo a choice an admin deliberately made. See
-    /// WavelengthLightningConnectionStringHandler for both halves.
+    /// passed explicitly at each call site. Only two kinds of caller ever pass true: a verified
+    /// administrator's own request (the connection-string handler's Create, mid-save, checking the
+    /// live ambient user), and every other caller re-reading a string that already went through a
+    /// save an administrator made - the handler's own later calls to Create (an invoice, a payout, a
+    /// background poll - none of which carry that admin's request context), WavedProcessManager
+    /// re-reading persisted flags at (re)start, and the dashboard/Advanced controllers re-deriving
+    /// flags from the store's live connection string. All of those non-admin-request callers pass
+    /// <see cref="WavedStoreSettings.AllowLocalEndpoints"/> (via
+    /// <see cref="IWavedStoreApprovals.AllowsLocalEndpoints"/> or the settings row directly) rather
+    /// than a live admin check, which is what carries the admin's decision forward: a value accepted
+    /// once must keep being accepted on every later call that re-validates the same already-approved
+    /// string, not just the admin's own. A store with no marker - never approved for a local value in
+    /// the first place - validates strictly on every one of these paths, admin-request or not. See
+    /// WavelengthLightningConnectionStringHandler for where each half actually happens.
     ///
     /// Keys this class does not know about pass. That is safe only because the allowlist has already
     /// decided which keys can get here at all, and because a key added to it later is by definition
@@ -73,6 +108,11 @@ public static class WavedFlagValues
             else if (IsPeerListFlag(key))
             {
                 if (!ValidatePeerList(key, value, allowLocal, out error))
+                    return false;
+            }
+            else if (key.Equals(ServerFlag, StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ValidateServer(key, value, allowLocal, out error))
                     return false;
             }
         }
@@ -131,6 +171,49 @@ public static class WavedFlagValues
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Validates a "server" value against what it actually becomes: the literal gRPC target waved
+    /// dials via grpc.NewClient (see WavedOperatorServer.ToWavedFlagValue for the one translation
+    /// that happens between this value and that flag - stripping a leading http(s):// scheme, and
+    /// nothing else).
+    ///
+    /// Deliberately stricter than ValidateUrl: this is not an HTTP URL whose Host and dial target are
+    /// the same thing by construction, it is a bare gRPC dial address, and gRPC's target syntax
+    /// treats anything shaped like "scheme://..." as selecting a resolver rather than as an address
+    /// to be validated as a whole (see this class's doc comment for the concrete
+    /// "passthrough://8.8.8.8/127.0.0.1:10029" bypass this exists to close). So the value is rejected
+    /// outright - before any host is even extracted - if anything survives stripping the one
+    /// legitimate http(s) prefix besides a bare host:port: a real one never contains a "/", since
+    /// waved's own defaults (see WavedOperatorServer.DefaultFor) and every sample this plugin shows
+    /// are always exactly "host:port", with or without that one scheme in front.
+    /// </summary>
+    private static bool ValidateServer(string key, string value, bool allowLocal, out string? error)
+    {
+        error = null;
+        var target = WavedOperatorServer.ToWavedFlagValue(value);
+
+        if (target.Contains('/'))
+        {
+            error = $"'{key}' must be a plain host:port address (optionally prefixed with http:// or " +
+                    $"https://), not a URL with a path or another scheme - '{value}' is not one.";
+            return false;
+        }
+
+        if (!TryParseHostPort(target, out var host, out _))
+        {
+            error = $"'{key}' must be a host:port address (optionally prefixed with http:// or " +
+                    $"https://) - '{value}' is not one.";
+            return false;
+        }
+
+        if (allowLocal || !IsLocalHost(host))
+            return true;
+
+        error = $"'{key}' may not point at a local or private address ({host}). Ask the server " +
+                "administrator to allow it if this operator really is on your own network.";
+        return false;
     }
 
     /// <summary>

@@ -35,7 +35,12 @@ Upload that file as described below.
 3. Confirm it loaded: **Server Settings → Plugins** should list "Wavelength."
 
 By default, each store's `waved` data lives under `<BTCPay data dir>/Plugins/Wavelength/stores/`,
-listens on loopback starting at port `10029`, and defaults to `mainnet`.
+listens on loopback starting at port `10029`, and defaults to whatever network this BTCPay
+instance itself runs on (mainnet/testnet/regtest/signet) — not a separate, easy-to-forget setting
+that could silently diverge from it. Set `WAVELENGTH_NETWORK` to override this server-wide default
+explicitly: for `testnet4` or `simnet`, which BTCPay has no concept of at all, or to deliberately
+run Wavelength on a different network than the rest of the instance. A store's own connection
+string can still override the server-wide default further with its own `network=` flag.
 
 ### Backing up or migrating this instance
 
@@ -77,15 +82,28 @@ Generate a fresh token there, save it, and that store is up to date.
 
 ## Server administration
 
-### Wavelength is opt-in, per server or per store
+### Wavelength is on for every store by default, with a stricter opt-in available
 
 Running Wavelength means the server spawns a long-lived `waved` process for a store and — once
 someone clicks **Create wallet** — holds a wallet seed on that store's behalf. That is a decision
-about the server's resources and the server's custody of a key, not about one store, so it is gated
-the way BTCPay gates its own internal Lightning node and hot wallets (**Server Settings → Policies**):
-**a store owner cannot enable Wavelength for a store unless a server administrator has approved it.**
+about the server's resources and the server's custody of a key, not about one store - BTCPay core
+gates the comparable cases (its own internal Lightning node and hot wallets) behind a server
+administrator, under **Server Settings → Policies**. This plugin's own default does **not** mirror
+that: any store owner can enable Wavelength for their own store, no administrator approval needed,
+since this plugin exists specifically to be a store wallet backend rather than a general-purpose
+capability every BTCPay operator needs to individually gate.
 
-Two ways to approve:
+An operator who wants the stricter, admin-approval-required behaviour instead can still have it.
+There is no settings page for this, so set it with an environment variable on whatever runs
+BTCPay:
+
+```bash
+WAVELENGTH_ALLOW_ALL_STORES=false
+```
+
+This is read at runtime (no rebuild or plugin change needed) and overrides whatever is persisted.
+With it set, a store owner cannot enable Wavelength for a store unless a server administrator has
+approved it first - in one of two ways:
 
 - **For one store**: a server administrator saves that store's wavelength connection string once
   (the usual first step anyway, on the store's **Lightning → Setup Lightning Node** page). The store
@@ -93,20 +111,19 @@ Two ways to approve:
   normally — nothing needs re-approving, and store owners do not have to ask again for routine
   payments, payouts, or invoice creation. Merely viewing a store's Wavelength dashboard as an
   administrator is not what grants this; the deliberate save is.
-- **For every store at once**: turn on **AllowForAllStores**. There is no settings page for this
-  yet, so set it with an environment variable on whatever runs BTCPay:
+- **For every store at once again**: set `WAVELENGTH_ALLOW_ALL_STORES=true` (or unset it, since
+  that is the default) - the per-store approvals recorded while it was off are unaffected, and
+  every store, approved or not, can use Wavelength again.
 
-  ```bash
-  WAVELENGTH_ALLOW_ALL_STORES=true
-  ```
+Turning `AllowForAllStores` off is a real revoke for every store that never had an individual
+approval: a save made while it was on does **not** leave a store with a private approval
+afterward — only an administrator's own save of that store's connection string records that. So a
+store approved only because `AllowForAllStores` was on loses access the moment it is turned back
+off, same as if it had never been approved.
 
-  This is read at runtime (no rebuild or plugin change needed), and it overrides whatever is
-  persisted. Turning it off again is a real revoke for every store that never had an individual
-  approval: a save made while it was on does **not** leave a store with a private approval
-  afterward — only an administrator's own save of that store's connection string records that.
-
-A store that has not been approved sees a clear message rather than a broken page: saving a
-connection string is refused with an explanation, and the store's Wavelength dashboard says the
+A store that has not been approved (only relevant with `AllowForAllStores` set to false) sees a
+clear message rather than a broken page: saving a connection string is refused with an
+explanation, and the store's Wavelength dashboard says the
 same thing. An administrator is never refused.
 
 ### Limiting how many waved processes run at once
@@ -135,9 +152,9 @@ the **Wavelength** entry for ready-made connection string samples, pre-filled wi
 to that store, e.g.:
 
 ```
-type=wavelength;token=<generated for this store>
-type=wavelength;token=<generated for this store>;network=signet
-type=wavelength;token=<generated for this store>;wallet.type=btcwallet
+type=wavelength;token=<generated for this store>;server=https://wavelength.lightning.finance:443
+type=wavelength;token=<generated for this store>;network=signet;server=https://signet.wavelength.lightning.finance:443
+type=wavelength;token=<generated for this store>;wallet.type=btcwallet;server=https://wavelength.lightning.finance:443
 ```
 
 That token is unique to this store and stable across page loads, so the string shown here is the
@@ -162,16 +179,59 @@ would otherwise let a connection string read or write an arbitrary file on the s
 a debug endpoint, rather than just configure the wallet - see `WavedAllowedFlags` in the plugin
 source for the exact list and the reasoning behind it.
 
-The flags that name an URL or a peer are also **checked by value**, not just by key: a
-`wallet.esploraurl`, `wallet.feeurl`, `wallet.btcwallet_peers`, or `wallet.btcwallet_addpeers` value
-that points at a local or private address — loopback, an RFC1918 or link-local address (including
-`169.254.169.254`), an IPv6 link-local or unique-local address, or a `.internal`/`.local`/`.lan`
-name — is refused, because `waved` runs on the server and would otherwise be a way to make the
-server itself fetch or connect to addresses on its own internal network. A server administrator
-saving such a value is allowed to (they may genuinely run their own esplora or a bitcoind peer on
-their LAN); anyone else asks their administrator. Note that this validation does not resolve DNS, so
-a public hostname that resolves to a private address at fetch time still gets through: the check
-narrows what is reachable rather than closing the class of attack off entirely.
+**`server` is this store's Ark operator address.** Whether it's strictly *required* depends on which
+BTCPay Server version you run: this plugin's own code never requires it (leave it out and `waved`
+uses its own built-in default for whichever `network` you chose), and the exact BTCPay Server
+version this plugin is built against (v2.4.2) doesn't require it either - but BTCPay's current
+release line does, refusing to save *any* custom Lightning connection string with no `server` key
+at all unless the person saving it is a server administrator, and that check runs before this plugin
+ever sees the string on that version. Since most real deployments are closer to that version than to
+the exact one this plugin is pinned to, the samples above include `server` with the right default
+for each network - the same address `waved` would use anyway if `server` were left unset - so there
+is nothing to figure out for the common case, and the samples work regardless of which BTCPay Server
+version you're on. Only change the value if you run (or were given access to) a different Ark
+operator, and keep it matching whichever `network` you use: `waved` does not cross-check the two for
+you.
+
+If you do set a custom value, it needs an explicit `http://` or `https://` scheme even though
+`waved` itself only ever dials the bare `host:port` form (the scheme is stripped before it reaches
+`waved`) - BTCPay's own save-time check (on every version) additionally requires the value to parse
+as an absolute URL for a non-admin to save it at all; a bare `your-operator.example.com:443` is
+parsed as an opaque URI with no real host and is refused unless the person saving it is a server
+administrator, even though this plugin itself would accept it.
+
+The flags that name an URL, a peer, or the operator server are also **checked by value**, not just
+by key: a `wallet.esploraurl`, `wallet.feeurl`, `wallet.btcwallet_peers`, `wallet.btcwallet_addpeers`,
+or `server` value that points at a local or private address — loopback, an RFC1918 or link-local
+address (including `169.254.169.254`), an IPv6 link-local or unique-local address, or a
+`.internal`/`.local`/`.lan` name — is refused, because `waved` runs on the server and would otherwise
+be a way to make the server itself fetch or connect to addresses on its own internal network. A
+server administrator saving such a value is allowed to (they may genuinely run their own esplora, a
+bitcoind peer, or an Ark operator on their LAN); anyone else asks their administrator. Note that this
+validation does not resolve DNS, so a public hostname that resolves to a private address at fetch
+time still gets through: the check narrows what is reachable rather than closing the class of attack
+off entirely.
+
+An administrator's approval is scoped to the *value* they actually saved, not a blanket "this store
+may use local values" permission: a store owner can keep saving the exact same approved local value
+(nothing to re-approve there), but cannot swap it for a *different* local address afterward without
+another administrator save. Without this, approving one private endpoint - a LAN esplora, say - would
+otherwise let the store owner silently redirect that same flag to the highest-value SSRF target,
+`169.254.169.254`, with no further administrator involvement at all.
+
+When set, `server` gets one more check on top of BTCPay's own, for everyone, admin or not: this
+plugin requires it to be a plain `host:port` (optionally with a leading `http://` or `https://`,
+which is stripped before it reaches `waved`) and nothing else. This isn't optional strictness —
+`waved` hands this value to gRPC's own dialer unparsed, and gRPC treats an `xyz://` prefix as
+*choosing a resolver*, not as part of an address validated as a whole. A value like
+`passthrough://8.8.8.8/127.0.0.1:10029` looks like it points at the public address `8.8.8.8` to a
+check that only inspects a URI's host — which is exactly how BTCPay core's own check reads it too,
+since it was never written with gRPC's target syntax in mind — but gRPC's `passthrough` resolver
+ignores that address entirely and dials the literal endpoint after the slash instead:
+`127.0.0.1:10029`, reaching another store's `waved` instance on loopback rather than anything public.
+This plugin's own check closes that off regardless of what BTCPay's check does or does not catch -
+and regardless of whether BTCPay's check even runs before this plugin sees the string in the first
+place, which depends on the exact BTCPay Server version in use.
 
 **Before switching a store's wallet backend or network, delete its existing wallet first** —
 `waved` can't switch backend or network on an existing wallet in place. Changing flags on an

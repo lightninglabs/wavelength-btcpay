@@ -249,6 +249,123 @@ public class WavelengthLightningConnectionStringHandlerTests
         Assert.Equal("http://127.0.0.1:5000/api", extraFlags["wallet.esploraurl"]);
     }
 
+    private static Dictionary<string, string> Flags(params (string Key, string Value)[] entries)
+        => entries.ToDictionary(e => e.Key, e => e.Value, StringComparer.OrdinalIgnoreCase);
+
+    // The exact scenario reported: an administrator approved wallet.esploraurl pointed at a LAN
+    // esplora (127.0.0.1), which set AllowLocalEndpoints for this store - a blanket "this store may
+    // use local values", not "this store may use 127.0.0.1 specifically". Without this check, a
+    // later non-admin save redirecting that same key to the cloud metadata endpoint was accepted
+    // purely because the marker was already true, with BTCPay core's own IsSafe providing no
+    // backstop for this key at all (it only ever looks at "server").
+    [Fact]
+    public void RejectsANonAdminSaveThatRedirectsAnApprovedLocalFlagToADifferentLocalAddress()
+    {
+        var persisted = Flags((WavedFlagValues.EsploraUrlFlag, "http://127.0.0.1:5000/api"));
+        var redirected = Flags((WavedFlagValues.EsploraUrlFlag, "http://169.254.169.254/latest/meta-data/"));
+
+        Assert.False(WavelengthLightningConnectionStringHandler.LocalValuesMatchWhatIsAlreadyPersisted(
+            redirected, persisted));
+    }
+
+    // The allowance this check must preserve: a non-admin re-saving the exact same connection
+    // string (same local value, nothing introduced or changed) must keep working without needing
+    // the administrator to approve it all over again.
+    [Fact]
+    public void AcceptsANonAdminSaveThatMerelyRepeatsTheAlreadyApprovedLocalValue()
+    {
+        var persisted = Flags((WavedFlagValues.EsploraUrlFlag, "http://127.0.0.1:5000/api"));
+        var repeated = Flags((WavedFlagValues.EsploraUrlFlag, "http://127.0.0.1:5000/api"));
+
+        Assert.True(WavelengthLightningConnectionStringHandler.LocalValuesMatchWhatIsAlreadyPersisted(
+            repeated, persisted));
+    }
+
+    // Changing or adding an unrelated, non-local flag alongside an untouched local one must not
+    // itself demand re-approval - only the local value's own identity matters.
+    [Fact]
+    public void AcceptsANonAdminSaveThatChangesAnUnrelatedNonLocalFlag()
+    {
+        var persisted = Flags(
+            (WavedFlagValues.EsploraUrlFlag, "http://127.0.0.1:5000/api"),
+            ("network", "mainnet"));
+        var changedElsewhere = Flags(
+            (WavedFlagValues.EsploraUrlFlag, "http://127.0.0.1:5000/api"),
+            ("network", "signet"));
+
+        Assert.True(WavelengthLightningConnectionStringHandler.LocalValuesMatchWhatIsAlreadyPersisted(
+            changedElsewhere, persisted));
+    }
+
+    // A local value that was never approved for this store at all (nothing persisted yet) must not
+    // be accepted just because some OTHER store, or a prior session, happened to set the marker -
+    // GetCurrentlySavedFlags returning null is "nothing to compare against", not "anything goes".
+    [Fact]
+    public void RejectsANewLocalValueWhenNothingIsPersistedYet()
+    {
+        var candidate = Flags((WavedFlagValues.EsploraUrlFlag, "http://10.0.0.5/api"));
+
+        Assert.False(WavelengthLightningConnectionStringHandler.LocalValuesMatchWhatIsAlreadyPersisted(
+            candidate, persistedFlags: null));
+    }
+
+    // A flag whose new value is public (not local at all) was never gated by the escape hatch in
+    // the first place - whether it changed relative to what is persisted is irrelevant.
+    [Fact]
+    public void AcceptsANonAdminSaveThatChangesAUrlFlagToADifferentPublicValue()
+    {
+        var persisted = Flags((WavedFlagValues.EsploraUrlFlag, "https://esplora.example.com/api"));
+        var changedToAnotherPublicUrl = Flags((WavedFlagValues.EsploraUrlFlag, "https://mempool.space/api"));
+
+        Assert.True(WavelengthLightningConnectionStringHandler.LocalValuesMatchWhatIsAlreadyPersisted(
+            changedToAnotherPublicUrl, persisted));
+    }
+
+    // The exact regression reported: BTCPay core's "Test connection" button runs the very same
+    // ValidatePaymentMethodConfig -> Create path a real save does, for whatever is currently typed
+    // into the form, without ever persisting it. Comparing a non-admin's candidate flags against a
+    // value recorded at the moment an administrator's request was merely validated - rather than
+    // against what is actually saved - let an admin's Test(B) against a store whose saved string
+    // still pointed at an earlier approved local value A silently record B as the latest approval,
+    // breaking the very next non-admin checkout for the still-saved A. ExtractPersistedFlags is what
+    // closes that: it only ever parses whatever string it is handed, and in production that string is
+    // always GetCurrentlySavedFlags's live read of the store's own saved connection string - never
+    // anything an admin's request merely validated along the way - so there is nothing for a Test
+    // click to ever leave behind for a later request to be compared against.
+    [Fact]
+    public void ExtractPersistedFlagsReflectsOnlyWhatIsActuallySavedNotWhatWasMerelyTested()
+    {
+        const string actuallySavedConnectionStringA =
+            "type=wavelength;token=abc;wallet.esploraurl=http://127.0.0.1:5000/api";
+
+        var persistedFlags = WavelengthLightningConnectionStringHandler.ExtractPersistedFlags(actuallySavedConnectionStringA);
+
+        // Store A's own candidate, from a later non-admin checkout, must still match what was
+        // actually saved for it - regardless of what an admin's Test(B) click elsewhere might have
+        // asked Create to validate in between, since that never reaches this function's input at all.
+        var candidateA = Flags((WavedFlagValues.EsploraUrlFlag, "http://127.0.0.1:5000/api"));
+        Assert.True(WavelengthLightningConnectionStringHandler.LocalValuesMatchWhatIsAlreadyPersisted(
+            candidateA, persistedFlags));
+
+        // The value an admin merely tested (B) must NOT be treated as something approved for A.
+        var testedButNeverSavedB = Flags((WavedFlagValues.EsploraUrlFlag, "http://169.254.169.254/latest/meta-data/"));
+        Assert.False(WavelengthLightningConnectionStringHandler.LocalValuesMatchWhatIsAlreadyPersisted(
+            testedButNeverSavedB, persistedFlags));
+    }
+
+    [Fact]
+    public void ExtractPersistedFlagsIsNullWhenNothingIsSaved()
+        => Assert.Null(WavelengthLightningConnectionStringHandler.ExtractPersistedFlags(null));
+
+    // A store whose Lightning node was switched away from Wavelength entirely (or never configured
+    // for it) has nothing for a wavelength candidate to be compared against - handled the same way as
+    // "nothing saved yet" rather than attempting to parse a foreign connection string's keys as if
+    // they were waved flags.
+    [Fact]
+    public void ExtractPersistedFlagsIgnoresASavedConnectionStringOfADifferentType()
+        => Assert.Null(WavelengthLightningConnectionStringHandler.ExtractPersistedFlags(
+            "type=lnd-rest;server=https://example.com"));
+
     // Each key carries a value that passes its own check as well as the key allowlist: the two
     // URL-shaped keys need a real public URL, and everything else is a plain count/duration/enum.
     [Theory]
@@ -260,6 +377,7 @@ public class WavelengthLightningConnectionStringHandlerTests
     [InlineData("wallet.esploraurl", "https://esplora.example.com/api")]
     [InlineData("wallet.feeurl", "https://fees.example.com/")]
     [InlineData("wallet.recoverywindow", "1")]
+    [InlineData("server", "https://wavelength.lightning.finance:443")]
     [InlineData("oor.maxsubmitretry", "1")]
     [InlineData("oor.limits.maxcheckpoints", "1")]
     [InlineData("unroll.bumpafterblocks", "1")]
@@ -298,6 +416,48 @@ public class WavelengthLightningConnectionStringHandlerTests
 
         Assert.Equal(0, approvals.WriteCount);
         Assert.False(approvals.IsApproved("store-a"));
+    }
+
+    // Reproduces the bug directly: an administrator's save of a local value is recorded on the
+    // store (FakeStoreApprovals.Approve with allowLocalEndpoints: true, standing in for a prior,
+    // already-completed RecordApproval), and every LATER call to Create for that same store's saved
+    // string carries no admin request context at all - an invoice, a payout, a background poll - so
+    // isServerAdmin is false on every one of them. Before the fix, Create still passed isServerAdmin
+    // alone as allowLocal, so this local value was accepted once (by the admin) and then rejected
+    // forever after (by everyone else, which in practice is almost every call) - breaking Lightning
+    // for a store an administrator had deliberately approved. The ArgumentNullException is the same
+    // "every gate passed" signal BackgroundReadOfAValidTokenRecordsNoApproval uses: a local-address
+    // rejection would instead come back as Create returning null with a non-null error.
+    [Fact]
+    public void BackgroundReadOfAnAdminApprovedLocalValueIsStillAccepted()
+    {
+        var approvals = new FakeStoreApprovals();
+        approvals.Approve("store-a", allowLocalEndpoints: true);
+        var handler = new WavelengthLightningConnectionStringHandler(
+            null!, _tokenProtector, approvals, new FakeServerSettings(), NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
+        var token = TokenFor("store-a");
+
+        Assert.Throws<ArgumentNullException>(() =>
+            handler.Create($"type=wavelength;token={token};wallet.esploraurl=http://127.0.0.1:5000/api", Network.Main, out _));
+    }
+
+    // The other half of the same fix: a store that was approved for ordinary use but never had a
+    // local value approved for it (the common case - most approved stores carry no local marker at
+    // all) must still be rejected strictly. The marker, not mere approval, is what the fix keys off.
+    [Fact]
+    public void BackgroundReadStillRejectsALocalValueTheStoreWasNeverApprovedFor()
+    {
+        var approvals = new FakeStoreApprovals();
+        approvals.Approve("store-a", allowLocalEndpoints: false);
+        var handler = new WavelengthLightningConnectionStringHandler(
+            null!, _tokenProtector, approvals, new FakeServerSettings(), NullLogger<WavelengthLightningConnectionStringHandler>.Instance);
+        var token = TokenFor("store-a");
+
+        var client = handler.Create(
+            $"type=wavelength;token={token};wallet.esploraurl=http://127.0.0.1:5000/api", Network.Main, out var error);
+
+        Assert.Null(client);
+        Assert.NotNull(error);
     }
 
     [Fact]

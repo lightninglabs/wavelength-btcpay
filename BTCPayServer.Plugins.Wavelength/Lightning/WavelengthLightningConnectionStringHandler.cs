@@ -1,5 +1,7 @@
 using BTCPayServer.Abstractions.Contracts;
+using BTCPayServer.Data;
 using BTCPayServer.Lightning;
+using BTCPayServer.Payments;
 using BTCPayServer.Plugins.Wavelength.Services;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
@@ -33,6 +35,10 @@ namespace BTCPayServer.Plugins.Wavelength.Lightning;
 /// </summary>
 public sealed class WavelengthLightningConnectionStringHandler : ILightningConnectionStringHandler
 {
+    // BTC is the only crypto code this handler is ever registered against - see
+    // UIWavelengthController, which carries the same constant for the same reason.
+    private static readonly PaymentMethodId LightningPaymentMethodId = PaymentTypes.LN.GetPaymentMethodId("BTC");
+
     private readonly IServiceProvider _serviceProvider;
     private readonly WavedStoreTokenProtector _tokenProtector;
     private readonly IWavedStoreApprovals _storeApprovals;
@@ -128,13 +134,70 @@ public sealed class WavelengthLightningConnectionStringHandler : ILightningConne
             return null;
         }
 
-        // The value check rides along inside TryParseExtraFlags (see WavedFlagValues), and the
-        // escape hatch is passed only for a verified administrator: a value aimed at the server's own
-        // network - a cloud metadata address, this instance's NBXplorer, another store's loopback
-        // waved instance - is refused before anything is persisted or started. RecordApproval below
-        // is what carries that decision forward, since a background restart re-reads persisted flags
-        // with no user to ask.
-        if (!TryParseExtraFlags(connectionString, out var extraFlags, out error, allowLocal: isServerAdmin))
+        // The value check rides along inside TryParseExtraFlags (see WavedFlagValues). The escape
+        // hatch is isServerAdmin OR'd with this store's own persisted AllowLocalEndpoints marker -
+        // not isServerAdmin alone - because Create is re-run on every single later use of an already
+        // saved connection string, not just at the moment someone saves it: an invoice, a payout, a
+        // background poll, none of which carry an administrator's own request context (isServerAdmin
+        // is false for all of them). An admin who was once allowed to save a local value - a LAN
+        // esplora, a local Ark operator - approved it exactly once; a store whose saved string still
+        // carries that value must keep working on every later call, not just the admin's own. Without
+        // the marker here, Create would re-reject the very value it just accepted the moment anyone
+        // other than that admin (which in practice means almost every call) asked for a client again -
+        // which is exactly the bug this fixes, found by reproducing it with a valid token against an
+        // approved store carrying a local server= value. isServerAdmin still has to stay in the OR: a
+        // brand new admin save introducing a local value for the first time has nothing in the marker
+        // yet (RecordApproval below is what writes it, and only after this call succeeds), so without
+        // isServerAdmin that very save would reject itself.
+        //
+        // AllowsLocalEndpoints is a blanket "this store may carry local values at all", though, not
+        // "this store may carry THESE SPECIFIC local values" - so for any non-admin request that
+        // names this store (a request context with an actingStoreId, as opposed to a true background
+        // re-read with no request behind it at all - see LocalValuesMatchWhatIsAlreadyPersisted's doc
+        // comment for why those are treated the same regardless of whether the caller is actually
+        // saving a new string or merely reconstructing a client for one already saved), the marker
+        // alone is not enough: it must also be true that the candidate flags are not introducing or
+        // changing which local value is used, compared against what this store's own Lightning
+        // payment method config CURRENTLY has saved (see GetCurrentlySavedFlags) - not against
+        // anything recorded at the moment an administrator was last asked to approve something.
+        // Otherwise an administrator approving one private endpoint (their own LAN esplora, say)
+        // would silently let the store owner replace it with any other local address afterward,
+        // including the highest-value SSRF target (169.254.169.254) - reproduced directly: after an
+        // admin approves wallet.esploraurl=http://127.0.0.1:5000/api, a non-admin save of
+        // wallet.esploraurl=http://169.254.169.254/latest/meta-data/ was accepted purely because the
+        // marker was already true, with BTCPay core's own IsSafe check providing no backstop for this
+        // particular key at all. A true background re-read is unaffected.
+        //
+        // Comparing against what an admin's request was merely asked to validate, rather than what is
+        // actually saved, was tried first and broke a different, adjacent case: BTCPay core's own
+        // "Test connection" button on the Lightning setup page runs this exact same
+        // ValidatePaymentMethodConfig -> Create path, for whatever is currently typed into the form,
+        // without the "save" branch that follows ever persisting it. An administrator testing a new
+        // local candidate (server B) while the store's actually saved string still pointed at an
+        // earlier approved local value (server A) recorded B as the latest approval - and the very
+        // next non-admin checkout for the still-saved A then compared A's own flags against B and
+        // rejected them, breaking a store an admin had never actually touched. Reproduced directly
+        // with a focused handler test simulating Test(B) followed by checkout(A). Comparing against
+        // the live row instead of anything staged by a prior request has no such window: whatever a
+        // non-admin reconstruction call is itself handed by core to validate is, by construction, the
+        // very value core just read from that same row, so it always matches trivially; and a
+        // disallowed value already sitting on that row could only have gotten there through this same
+        // accepting path when it was actually saved, so trusting it here is not a new hole.
+        var allowLocal = isServerAdmin || _storeApprovals.AllowsLocalEndpoints(storeId);
+        if (!isServerAdmin && allowLocal && context is not null && actingStoreId is not null)
+        {
+            // allowLocal=true here is only to extract the flags for comparison, not the final
+            // verdict - a disallowed key or malformed value fails identically regardless of
+            // allowLocal (see WavedFlagValues: the escape hatch gates locality, not parsing), so a
+            // failure here is never masked by this being more lenient than the real check below.
+            if (!TryParseExtraFlags(connectionString, out var candidateFlags, out error, allowLocal: true))
+                return null;
+
+            if (!LocalValuesMatchWhatIsAlreadyPersisted(candidateFlags, GetCurrentlySavedFlags(context.GetStoreDataOrNull())))
+                allowLocal = false;
+        }
+
+        if (!TryParseExtraFlags(connectionString, out var extraFlags, out error, allowLocal))
             return null;
 
         if (context is not null && actingStoreId is not null)
@@ -255,6 +318,111 @@ public sealed class WavelengthLightningConnectionStringHandler : ILightningConne
     /// </summary>
     private static bool HasLocalFlagValues(IReadOnlyDictionary<string, string> extraFlags)
         => !WavedFlagValues.Validate(extraFlags, out _, allowLocal: false);
+
+    /// <summary>
+    /// Whether every address-valued flag in candidateFlags that needs the local-endpoint escape
+    /// hatch to pass strict validation already has that EXACT value in persistedFlags - i.e. whether
+    /// this non-admin save only re-saves local values an administrator already reviewed, rather than
+    /// introducing or changing one. See Create's call site for why this distinction matters: a
+    /// single persisted marker means "may use local values at all", not "may use THESE local
+    /// values", and conflating the two lets a store owner redirect an admin-approved local endpoint
+    /// to any other local address with no further admin involvement.
+    ///
+    /// Only asked when there is a request context naming this store - never for a true background
+    /// re-read (the Lightning listener, a payout processor, a cron-driven poll), where there is no
+    /// request to compare against anything and nothing for a value to have changed relative to.
+    /// That includes requests that merely reconstruct a client from an already-saved string rather
+    /// than save a new one - an invoice's checkout page, most commonly, which carries this store's id
+    /// but no administrator. Those are deliberately not told apart from an actual save here: both
+    /// compare the same way, against <see cref="GetCurrentlySavedFlags"/> - this store's actual,
+    /// currently saved Lightning connection string, read fresh on every call rather than anything
+    /// recorded at some earlier moment (see that method's doc comment for why) - so a request that
+    /// merely reconstructs a client for a value already saved finds a match immediately, and an
+    /// actual change still requires an admin to have actually saved it.
+    ///
+    /// Checked per flag, not as a whole-string comparison: changing or adding an unrelated,
+    /// non-local flag (network=signet, say) alongside an untouched local one must not itself demand
+    /// re-approval, and a flag whose new value validates fine strictly (a public URL, a non-address
+    /// flag entirely) was never gated by the escape hatch in the first place, so whether it changed
+    /// is irrelevant here.
+    /// </summary>
+    internal static bool LocalValuesMatchWhatIsAlreadyPersisted(
+        IReadOnlyDictionary<string, string> candidateFlags, IReadOnlyDictionary<string, string>? persistedFlags)
+    {
+        foreach (var (key, value) in candidateFlags)
+        {
+            if (WavedFlagValues.Validate(new Dictionary<string, string> { [key] = value }, out _, allowLocal: false))
+                continue;
+
+            if (persistedFlags is null ||
+                !persistedFlags.TryGetValue(key, out var persistedValue) ||
+                !string.Equals(persistedValue, value, StringComparison.Ordinal))
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// This store's actual, currently saved Lightning connection string, parsed into extra flags the
+    /// same way <see cref="Create"/> parses its own candidate - or null if this store has no payment
+    /// method config available (<paramref name="store"/> is null, e.g. the route-value-only fallback
+    /// in <see cref="Create"/> with no authorization-attached StoreData) or its saved Lightning
+    /// connection string isn't a wavelength one at all (never configured, or switched to a different
+    /// node since).
+    ///
+    /// Read fresh from <paramref name="store"/> on every call rather than from anything cached or
+    /// recorded earlier: this is what <see cref="LocalValuesMatchWhatIsAlreadyPersisted"/> compares a
+    /// non-admin request's candidate flags against, and comparing against a value recorded by
+    /// RecordApproval at the moment an administrator's OWN request was validated - tried first -
+    /// turned out to be wrong, because validation is not the same thing as persistence. BTCPay core's
+    /// "Test connection" button on the Lightning setup page runs this exact same
+    /// ValidatePaymentMethodConfig -> Create path, for whatever is currently typed into the form,
+    /// without ever saving it: an administrator testing a new local candidate (server B) while the
+    /// store's actually saved string still pointed at an earlier approved value (server A) recorded B
+    /// as the latest approval under that design, and the very next non-admin checkout for the
+    /// still-saved A then found its own correct flags rejected against B - breaking a store the admin
+    /// had never actually touched. Reading the live row instead has no such window: whatever a
+    /// non-admin reconstruction call is itself handed by core to validate is, by construction, the
+    /// very value core just read from this same row, so it always matches trivially; and a disallowed
+    /// value already sitting on this row could only have gotten there through this same accepting
+    /// path when it was actually saved, so trusting it here is not a new hole.
+    ///
+    /// Reads the store's raw payment method config JSON directly (StoreData.GetPaymentMethodConfig
+    /// with no PaymentMethodHandlerDictionary argument) rather than going through the handlers
+    /// dictionary and LightningLikePaymentHandler.ParsePaymentMethodConfig the way
+    /// UIWavelengthController does. Injecting PaymentMethodHandlerDictionary here creates a cycle in
+    /// BTCPay's DI graph: the dictionary resolves every IPaymentMethodHandler, including
+    /// LightningLikePaymentHandler, whose constructor resolves LightningClientFactoryService, which
+    /// in turn resolves every ILightningConnectionStringHandler - this one included - to find out
+    /// which connection strings it can handle. Resolving the dictionary (or the Lightning client
+    /// factory) from inside this handler's own constructor therefore resolves back to this handler
+    /// before it exists. The connection string is all this method needs, and the raw JSON holds it
+    /// under "connectionString" (BlobSerializer camel-cases property names) without requiring
+    /// anything beyond StoreData itself.
+    /// </summary>
+    private IReadOnlyDictionary<string, string>? GetCurrentlySavedFlags(StoreData? store)
+    {
+        var saved = store?.GetPaymentMethodConfig(LightningPaymentMethodId);
+        return ExtractPersistedFlags((string?)saved?["connectionString"]);
+    }
+
+    /// <summary>
+    /// The pure parsing step <see cref="GetCurrentlySavedFlags"/> delegates to, split out so it can be
+    /// exercised directly with a plain string rather than a StoreData neither this test suite nor a
+    /// lightweight caller can cheaply build.
+    /// </summary>
+    internal static IReadOnlyDictionary<string, string>? ExtractPersistedFlags(string? savedConnectionString)
+    {
+        if (savedConnectionString is not { Length: > 0 } ||
+            !savedConnectionString.StartsWith("type=wavelength", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        // allowLocal: true - this string is, by definition, what is already saved for the store, so
+        // re-parsing it here is not re-deciding whether its values were allowed to be saved in the
+        // first place (see GetCurrentlySavedFlags's doc comment for why that is sound).
+        return TryParseExtraFlags(savedConnectionString, out var flags, out _, allowLocal: true) ? flags : null;
+    }
 
     private IHttpContextAccessor? ResolveHttpContextAccessor()
     {
