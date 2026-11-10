@@ -15,20 +15,14 @@
     <!-- Plugin Metadata -->
     <Product>Wavelength</Product>
     <Description>Adds wavelength, a self-custodial Ark/Lightning/on-chain wallet, to BTCPay Server as a Lightning wallet backend.</Description>
-    <Version>0.1.0</Version>
+    <!-- Tracks the pinned lightninglabs/wavelength release in scripts/fetch-waved-native.sh -
+         bump both together. -->
+    <Version>0.2.1.0</Version>
     <Authors>Lightning Labs</Authors>
     <Company>Lightning Labs</Company>
     <PackageProjectUrl>https://github.com/lightninglabs/wavelength-btcpay</PackageProjectUrl>
     <RepositoryUrl>https://github.com/lightninglabs/wavelength-btcpay</RepositoryUrl>
     <PackageTags>btcpay;wavelength;ark;lightning;bitcoin;payments</PackageTags>
-
-    <!--
-      TODO: mirror bark-btcpay's DownloadBarkNativeForPublish MSBuild target once wavelength
-      has tagged releases with published waved/wavecli binaries: pin a WavedNativeVersion,
-      download the linux-x64 (and other RID) binaries into Native/<rid>/ with SHA256
-      verification, BeforeTargets="ComputeFilesToPublish". Until then, binaries must be
-      placed manually under Native/<rid>/ for local development (see Services/WavedProcessManager.cs).
-    -->
   </PropertyGroup>
 
   <ItemGroup>
@@ -54,11 +48,46 @@
     <Protobuf Include="Protos\**\*.proto" GrpcServices="Client" ProtoRoot="Protos" />
   </ItemGroup>
 
-  <!-- Include native waved/wavecli binaries in build output, once present -->
+  <!-- Include the native waved binaries in build output, once present (placed there manually
+       for local dev - see scripts/plugin-register.sh, which runs a plain `dotnet build` and
+       needs this for a debug session - or by DownloadWavedNativeForPublish below at publish
+       time). -->
   <ItemGroup>
     <None Include="Native\**\*" Condition="Exists('Native')">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
       <Link>Native\%(RecursiveDir)%(Filename)%(Extension)</Link>
     </None>
   </ItemGroup>
+
+  <!-- Downloads and verifies the pinned lightninglabs/wavelength release's waved binary for
+       every RID WavedProcessManager.GetRuntimeIdentifier() can return, into Native/<rid>/,
+       before `dotnet publish` - so the BTCPay Plugin Builder (which only runs dotnet commands
+       against this repo, not scripts/build-plugin.sh) produces a complete, runnable .btcpay
+       without anyone building waved themselves. Skips a RID whose Native/<rid>/waved already
+       exists, so a developer's own manually-placed local build (picked up by the ItemGroup
+       above already) is left alone. See scripts/fetch-waved-native.sh for the pinned version,
+       the hashes, and how to bump them.
+
+       Adds straight to ResolvedFileToPublish below, inside this target, rather than relying on
+       the top-level None ItemGroup above to cover publish too: that glob is captured once at
+       project evaluation, and Build's own None -> _NoneWithTargetPath -> publish-list pass runs
+       as part of Publish's ordinary dependency chain before this target gets a turn, so a RID
+       directory THIS target creates during THIS publish would be invisible to that earlier
+       pass and silently left out - re-declaring the same None items this late does not help,
+       since nothing re-runs that pass over them afterward. ResolvedFileToPublish is the one
+       item group still consumed AFTER this target runs (by the final publish copy step), which
+       is what actually makes a from-scratch publish (no Native/ at all beforehand) bundle every
+       RID this run just fetched; the top-level glob alone still covers plain `dotnet build` for
+       local dev, and a RID that existed before THIS publish started is already included via
+       that same earlier pass, so it is not duplicated here. -->
+  <Target Name="DownloadWavedNativeForPublish" BeforeTargets="ComputeFilesToPublish">
+    <Exec Command="bash &quot;$(MSBuildProjectDirectory)/../scripts/fetch-waved-native.sh&quot;" />
+    <ItemGroup>
+      <_WavedNativeFileNewlyFetched Include="Native\**\*" Exclude="@(None)" Condition="Exists('Native')" />
+      <ResolvedFileToPublish Include="@(_WavedNativeFileNewlyFetched)">
+        <RelativePath>Native\%(RecursiveDir)%(Filename)%(Extension)</RelativePath>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
 </Project>

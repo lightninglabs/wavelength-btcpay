@@ -13,8 +13,13 @@ Each BTCPay store that uses it gets its own isolated `waved` process — its own
 
 ## Build
 
-You will need a `waved` binary, which you can either download from the [Wavelength Releases](https://github.com/lightninglabs/wavelength/releases), or compile yourself.
-On Linux for example, place the binary into your `wavelength-btcpay/BTCPayServer.Plugins.Wavelength/Native/linux-x64` folder.
+`scripts/build-plugin.sh` (and `dotnet publish` generally, including the BTCPay Plugin Builder)
+fetches and verifies the pinned [Wavelength release](https://github.com/lightninglabs/wavelength/releases)'s
+`waved` binary for every supported platform automatically - see `scripts/fetch-waved-native.sh`
+for the pinned version and how to bump it. You only need to place one yourself if you're
+developing against a local build of `waved`: drop it into
+`wavelength-btcpay/BTCPayServer.Plugins.Wavelength/Native/<rid>/` (e.g. `Native/linux-x64/`
+on Linux x64) and it takes precedence over the automatically-fetched one.
 
 Then, run the `build-plugin.sh` script.
 
